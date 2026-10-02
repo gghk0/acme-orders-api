@@ -1,0 +1,198 @@
+openapi: 3.0.3
+info:
+  title: Acme Orders API
+  version: 1.4.0
+  description: |
+    Order lifecycle service for the Acme commerce platform. Owns the order
+    state machine from checkout through fulfilment and cancellation.
+
+    ## Service dependencies
+
+    **This service calls:**
+
+    | Target service | Operation | Purpose |
+    |---|---|---|
+    | Acme Payments API (`acme-payments-api`) | `POST /v1/charges` | Authorise payment at checkout |
+    | Acme Payments API (`acme-payments-api`) | `POST /v1/charges/{chargeId}/refunds` | Refund on cancellation |
+    | Acme Inventory API (`acme-inventory-api`) | `POST /v1/reservations` | Hold stock for a pending order |
+    | Acme Inventory API (`acme-inventory-api`) | `DELETE /v1/reservations/{reservationId}` | Release stock on cancellation |
+    | SendGrid (external) | `POST /v3/mail/send` | Email order receipts |
+
+    **Services that call this service:**
+
+    - `acme-gateway` — public edge; forwards `POST /orders`, `GET /orders/{orderId}`,
+      and `POST /orders/{orderId}/cancel` after authenticating the shopper.
+
+    ## Data stores
+
+    - **PostgreSQL** `acme_orders` — tables `orders`, `order_items`, `order_events`
+
+    ## Notes for dependency analysis
+
+    `POST /orders` is the highest-fanout operation in the platform: it
+    synchronously touches Payments and Inventory in a single request. A breaking
+    change to `CreateOrderRequest` cascades to `acme-gateway` (public contract)
+    and to the checkout flow in the web client.
+  contact:
+    name: Acme Platform Team
+    email: platform@acme.example
+servers:
+  - url: https://orders.internal.acme.example/v1
+    description: Cluster-internal endpoint (service mesh)
+tags:
+  - name: orders
+    description: Order lifecycle operations
+paths:
+  /orders:
+    get:
+      operationId: listOrders
+      summary: List orders for the authenticated customer
+      tags: [orders]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/OrderStatus'
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+      responses:
+        '200':
+          description: A page of orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Order'
+    post:
+      operationId: createOrder
+      summary: Create an order
+      description: |
+        Creates an order in `pending_payment` state. Reserves stock through the
+        Inventory API and authorises payment through the Payments API. If either
+        downstream call fails, both are rolled back and no order is persisted.
+      tags: [orders]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: Order created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '402':
+          description: Payment authorisation failed (Payments API declined)
+        '409':
+          description: Insufficient stock (Inventory API rejected reservation)
+        '422':
+          description: Validation error
+  /orders/{orderId}:
+    get:
+      operationId: getOrder
+      summary: Fetch a single order
+      tags: [orders]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: The order
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '404':
+          description: Order not found
+  /orders/{orderId}/cancel:
+    post:
+      operationId: cancelOrder
+      summary: Cancel an order
+      description: |
+        Cancels an order that has not yet shipped. Releases the inventory
+        reservation and issues a refund through the Payments API.
+      tags: [orders]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Order cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '409':
+          description: Order already shipped and cannot be cancelled
+components:
+  parameters:
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  schemas:
+    OrderStatus:
+      type: string
+      enum: [pending_payment, paid, reserved, shipped, cancelled, refunded]
+    CreateOrderRequest:
+      type: object
+      required: [customerId, items, paymentMethodId]
+      properties:
+        customerId:
+          type: string
+          format: uuid
+        paymentMethodId:
+          type: string
+          description: Tokenised card reference held by the Payments service
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/OrderItemInput'
+    OrderItemInput:
+      type: object
+      required: [sku, quantity]
+      properties:
+        sku:
+          type: string
+        quantity:
+          type: integer
+          minimum: 1
+    Order:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        totalCents:
+          type: integer
+        currency:
+          type: string
+          default: USD
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItemInput'
+        chargeId:
+          type: string
+          description: Charge identifier returned by the Payments API
+        reservationId:
+          type: string
+          description: Reservation identifier returned by the Inventory API
+        createdAt:
+          type: string
+          format: date-time
